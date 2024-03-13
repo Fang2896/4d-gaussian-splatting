@@ -55,7 +55,7 @@ RasterizeGaussiansCUDA(
     const int image_width,
 	const torch::Tensor& sh,
 	const int degree,
-	const int degree_t, 
+	const int degree_t,
 	const torch::Tensor& campos,
 	const float timestamp,
 	const float time_duration,

@@ -57,6 +57,7 @@ __global__ void checkFrustum(int P,
 	const float* projmatrix,
 	bool* present)
 {
+	// 计算当前线程全局索引
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;

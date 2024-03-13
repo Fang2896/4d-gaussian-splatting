@@ -276,6 +276,8 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 }
 
 
+// 额外参数支持条件高斯模型和时间动态效果。
+// 处理了时间维度，通过计算时间缩放和动态调整原点位置来处理时间相关的变化
 __device__ void computeCov3D_conditional(const glm::vec3 scale, const float scale_t, float mod,
 		const glm::vec4 rot, const glm::vec4 rot_r, float* cov3D, float3& p_orig,
 		float t, const float timestamp, int idx, bool& mask, float& opacity)
@@ -317,11 +319,15 @@ __device__ void computeCov3D_conditional(const glm::vec3 scale, const float scal
 	glm::mat4 Sigma = glm::transpose(M) * M;
 	float cov_t = Sigma[3][3];
 	float marginal_t = __expf(-0.5*dt*dt/cov_t);
-	mask = marginal_t > 0.05;
+	mask = marginal_t > 0.05;	// 参考论文，会剔除掉t高斯分布中小于0.05的
 	if (!mask) return;
-	opacity*=marginal_t;;
+	// 核心代码！说明这篇文章的所谓的动态，其实只不过是t高斯边缘分布的动态改变各个3DG的透明度罢了！
+	opacity*=marginal_t;	
 	glm::mat3 cov11 = glm::mat3(Sigma);
+	// Σ_{1:3,4}
 	glm::vec3 cov12 = glm::vec3(Sigma[0][3],Sigma[1][3],Sigma[2][3]);
+	// 参考论文公式Σ_{xyz|t}:
+	// = Σ_{1:3,1:3} - Σ_{1:3,4} Σ^{-1}_{4,4} Σ_{1:3,4} （注意中间这个就是个常数）
 	glm::mat3 cov3D_condition = cov11 - glm::outerProduct(cov12, cov12) / cov_t;
 
 	// Covariance is symmetric, only store upper right
@@ -331,6 +337,9 @@ __device__ void computeCov3D_conditional(const glm::vec3 scale, const float scal
 	cov3D[3] = cov3D_condition[1][1];
 	cov3D[4] = cov3D_condition[1][2];
 	cov3D[5] = cov3D_condition[2][2];
+
+	// 这个就是相应的条件均值 μ_{xyz|t} ，但是这个为什么是dt，而不是 t - μ_t ?
+	// 这个dt 就是 timestamp-t ，所以按照论文来说，这个timestamp才是t，这个t才是 μt ？
     glm::vec3 delta_mean = cov12 / cov_t * dt;
 	p_orig.x+=delta_mean.x;
 	p_orig.y+=delta_mean.y;
@@ -406,6 +415,8 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	}
 	else
 	{
+		// 这个就是rotation 没有加上时间维度的。
+		// 也就是独立一个t的
 		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
 		cov3D = cov3Ds + idx * 6;
 		if (gaussian_dim == 4){  // no rot_4d
@@ -418,13 +429,14 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	}
 
 	// Perform near culling, quit if outside.
+	// 这个同时会计算p_view
 	float3 p_view;
 	if (!in_frustum(p_orig, viewmatrix, projmatrix, prefiltered, p_view))
 		return;
 
 	// Transform point by projecting
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
-	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float p_w = 1.0f / (p_hom.w + 0.0000001f);	// 齐次化坐标
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 
 	// Compute 2D screen-space covariance matrix
@@ -440,11 +452,11 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	// Compute extent in screen space (by finding eigenvalues of
 	// 2D covariance matrix). Use extent to compute a bounding rectangle
 	// of screen-space tiles that this Gaussian overlaps with. Quit if
-	// rectangle covers 0 tiles. 
+	// rectangle covers 0 tiles.
 	float mid = 0.5f * (cov.x + cov.z);
 	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
 	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
-	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));	// 椭圆特征值的最大值
 	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
 	uint2 rect_min, rect_max;
 	getRect(point_image, my_radius, rect_min, rect_max, grid);
@@ -459,6 +471,7 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 		if (gaussian_dim == 3 || force_sh_3d){
 			result = computeColorFromSH(idx, D, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped);
 		}else{
+			// 核心函数
 			result = computeColorFromSH_4D(idx, D, D_t, M, (glm::vec3*)orig_points, *cam_pos, shs, clamped, ts, timestamp, time_duration);
 		}
 		rgb[idx * C + 0] = result.x;
@@ -516,6 +529,7 @@ renderCUDA(
 	int toDo = range.y - range.x;
 
 	// Allocate storage for batches of collectively fetched data.
+	// 同一线程块之间的所有线程共享
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
@@ -532,6 +546,7 @@ renderCUDA(
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
 		// End if entire block votes that it is done rasterizing
+		// 同一线程块的所有线程之间进行同步。
 		int num_done = __syncthreads_count(done);
 		if (num_done == BLOCK_SIZE)
 			break;
@@ -545,6 +560,8 @@ renderCUDA(
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
+
+		// 同步同一线程块中的所有线程
 		block.sync();
 
 		// Iterate over current batch
@@ -577,10 +594,11 @@ renderCUDA(
 			}
 
 			// Eq. (3) from 3D Gaussian splatting paper.
+			// 这个feature就是colors
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 			for (int ch = 0; ch < 2; ch++)
-				Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;
+				Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;			
 			D += depths[collected_id[j]] * alpha * T;
 
 			T = test_T;
@@ -622,6 +640,7 @@ void FORWARD::render(
 	float* out_flow,
 	float* out_depth)
 {
+	// 每个线程都会执行一次
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
