@@ -279,7 +279,7 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 // 额外参数支持条件高斯模型和时间动态效果。
 // 处理了时间维度，通过计算时间缩放和动态调整原点位置来处理时间相关的变化
 __device__ void computeCov3D_conditional(const glm::vec3 scale, const float scale_t, float mod,
-		const glm::vec4 rot, const glm::vec4 rot_r, float* cov3D, float3& p_orig,
+		const glm::vec4 rot, const glm::vec4 rot_r, float* cov3D, float3& p_orig, float3& flow_3d,
 		float t, const float timestamp, int idx, bool& mask, float& opacity)
 {
 	// Create scaling matrix
@@ -344,6 +344,10 @@ __device__ void computeCov3D_conditional(const glm::vec3 scale, const float scal
 	p_orig.x+=delta_mean.x;
 	p_orig.y+=delta_mean.y;
 	p_orig.z+=delta_mean.z;
+
+	flow_3d.x = delta_mean.x;
+	flow_3d.y = delta_mean.y;
+	flow_3d.z = delta_mean.z;
 }
 
 // Perform initial steps for each Gaussian prior to rasterization.
@@ -372,6 +376,7 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	const float focal_x, float focal_y,
 	int* radii,
 	float2* points_xy_image,
+	float2* flow_xy_image,		// 这里加了一个flow的，表示该像素点的flow！
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
@@ -396,11 +401,12 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 
 	// Transform point by projecting
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+	float3 flow_3d = {0.0f, 0.0f, 0.0f};
 	float opacity = opacities[idx];
 
 	// If 3D covariance matrix is precomputed, use it, otherwise compute
 	// from scaling and rotation parameters.
-	const float* cov3D;
+	const float* cov3D;	// 可以改变指针指向，但不能改变指向的值
 	if (cov3D_precomp != nullptr)
 	{
 		cov3D = cov3D_precomp + idx * 6;
@@ -409,7 +415,9 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	{
 		bool time_mask=true;
 		computeCov3D_conditional(scales[idx], scales_t[idx], scale_modifier,
-			rotations[idx], rotations_r[idx], cov3Ds + idx * 6, p_orig, ts[idx], timestamp, idx, time_mask, opacity);
+			rotations[idx], rotations_r[idx], cov3Ds + idx * 6, 
+			p_orig, flow_3d,	// 关键的两个
+			ts[idx], timestamp, idx, time_mask, opacity);
 		if (!time_mask) return;
 		cov3D = cov3Ds + idx * 6;
 	}
@@ -438,6 +446,12 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);	// 齐次化坐标
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+
+	// 将3d空间的绝对flow转换到摄像机坐标系下，然后转到2D平面下
+	float3 flow_view = transformVec4x3(flow_3d, viewmatrix);
+	float2 flow_image = {0.0f, 0.0f};
+	flow_image.x = flow_view.x * focal_x;
+	flow_image.y = flow_view.y * focal_y;
 
 	// Compute 2D screen-space covariance matrix
 	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
@@ -483,6 +497,7 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 	depths[idx] = p_view.z;
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
+	flow_xy_image[idx] = flow_image;	// 注意这里加上了flow
 	// Inverse 2D covariance and opacity neatly pack into one float4
 	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
@@ -498,6 +513,7 @@ renderCUDA(
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
 	const float2* __restrict__ points_xy_image,
+	const float2* __restrict__ flow_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ flows,
 	const float* __restrict__ depths,
@@ -532,6 +548,7 @@ renderCUDA(
 	// 同一线程块之间的所有线程共享
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float2 collected_flow_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	// Initialize helper variables
@@ -558,6 +575,7 @@ renderCUDA(
 			int coll_id = point_list[range.x + progress];
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_flow_xy[block.thread_rank()] = flow_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 		}
 
@@ -573,6 +591,7 @@ renderCUDA(
 			// Resample using conic matrix (cf. "Surface 
 			// Splatting" by Zwicker et al., 2001)
 			float2 xy = collected_xy[j];
+			float2 flow_xy = collected_flow_xy[j];
 			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			float4 con_o = collected_conic_opacity[j];
 			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
@@ -597,8 +616,11 @@ renderCUDA(
 			// 这个feature就是colors
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-			for (int ch = 0; ch < 2; ch++)
-				Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;			
+			// for (int ch = 0; ch < 2; ch++)
+			// 	Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;
+			Flow[0] += flow_xy.x * alpha * T;
+			Flow[1] += flow_xy.y * alpha * T;
+
 			D += depths[collected_id[j]] * alpha * T;
 
 			T = test_T;
@@ -629,6 +651,7 @@ void FORWARD::render(
 	const uint32_t* point_list,
 	int W, int H,
 	const float2* means2D,
+	const float2* flow2D,
 	const float* colors,
 	const float* flows,
 	const float* depths,
@@ -646,6 +669,7 @@ void FORWARD::render(
 		point_list,
 		W, H,
 		means2D,
+		flow2D,
 		colors,
 		flows,
 		depths,
@@ -682,6 +706,7 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 	const float tan_fovx, float tan_fovy,
 	int* radii,
 	float2* means2D,
+	float2* flow2D,	// 这个是多加的
 	float* depths,
 	float* cov3Ds,
 	float* rgb,
@@ -715,6 +740,7 @@ void FORWARD::preprocess(int P, int D, int D_t, int M,
 		focal_x, focal_y,
 		radii,
 		means2D,
+		flow2D,
 		depths,
 		cov3Ds,
 		rgb,

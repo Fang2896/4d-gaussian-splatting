@@ -12,6 +12,7 @@
 import os
 import random
 import torch
+import datetime
 from torch import nn
 from utils.loss_utils import l1_loss, ssim, msssim
 from gaussian_renderer import render
@@ -28,11 +29,43 @@ import numpy as np
 from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import DataLoader
+
+from utils.flow_viz import flow_to_image
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+
+# def draw_flow_arrows(flow, step=10, scale=1, device='cuda'):
+#     flow = flow.cpu().numpy()
+#     H, W = flow.shape[1], flow.shape[2]
+
+#     fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
+#     ax = plt.gca()
+#     ax.imshow(np.zeros((H, W, 3)), origin='lower', cmap='gray')
+    
+#     # 生成网格，每step个像素点画一个箭头
+#     Y, X = np.mgrid[0:H:step, 0:W:step].astype(int)
+#     U, V = flow[0, Y, X], flow[1, Y, X]
+    
+#     ax.quiver(X, Y, U, V, angles='xy', scale_units='xy', scale=scale, color='r', width=0.005)
+#     ax.axis('off')
+
+#     buf = io.BytesIO()
+#     plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+#     plt.close(fig)
+#     buf.seek(0)
+#     image = Image.open(buf).convert('RGB')
+
+#     image_tensor = torch.tensor(np.array(image), dtype=torch.float32).permute(2, 0, 1).div(255.0)
+
+#     return image_tensor.to(device)
+
+
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
@@ -66,7 +99,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-        
+
     if pipe.env_map_res:
         env_map = nn.Parameter(torch.zeros((3,pipe.env_map_res, pipe.env_map_res),dtype=torch.float, device="cuda").requires_grad_(True))
         env_map_optimizer = torch.optim.Adam([env_map], lr=opt.feature_lr, eps=1e-15)
@@ -252,13 +285,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         env_map_optimizer.step()
                         env_map_optimizer.zero_grad(set_to_none = True)
 
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
+        # 使用当前时间作为唯一字符串，精确到秒
+        current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
+            unique_str = os.getenv('OAR_JOB_ID')
         else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
+            unique_str = current_time
+        args.model_path = os.path.join("./output/", unique_str)
         
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
@@ -318,13 +353,18 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     
+                    flow = render_pkg["flow"]
+                    flow_uv = flow.permute(1,2,0).cpu().numpy()
+                    flow_rgb_tensor = torch.from_numpy(flow_to_image(flow_uv)).permute(2,0,1).float() / 255.0
+                    
                     depth = easy_cmap(render_pkg['depth'][0])
                     alpha = torch.clamp(render_pkg['alpha'], 0.0, 1.0).repeat(3,1,1)
                     if tb_writer and (idx < 5):
                         grid = [gt_image, image, alpha, depth]
                         grid = make_grid(grid, nrow=2)
                         tb_writer.add_images(config['name'] + "_view_{}/gt_vs_render".format(viewpoint.image_name), grid[None], global_step=iteration)
-                            
+                        tb_writer.add_images(config['name'] + "_view_{}/flow".format(viewpoint.image_name), flow_rgb_tensor.unsqueeze(0), global_step=iteration)
+                    
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                     ssim_test += ssim(image, gt_image).mean().double()
